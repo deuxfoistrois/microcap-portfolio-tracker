@@ -1,8 +1,26 @@
 {
-  "symbols": ["KLTR", "LUNG", "STTK", "MX", "TUSK"],
-  "positions": {"STTK": 80, "LUNG": 60, "KLTR": 100, "MX": 120, "TUSK": 145},
-  "stops": {"STTK": 0.60, "LUNG": 1.25, "KLTR": 1.40, "MX": 2.10, "TUSK": 1.80},
-  "initial_cash": 9.20,
+  "symbols": [
+    "KLTR",
+    "LUNG",
+    "STTK",
+    "MX",
+    "TUSK"
+  ],
+  "positions": {
+    "STTK": 80,
+    "LUNG": 60,
+    "KLTR": 100,
+    "MX": 120,
+    "TUSK": 145
+  },
+  "stops": {
+    "STTK": 0.6,
+    "LUNG": 1.25,
+    "KLTR": 1.4,
+    "MX": 2.1,
+    "TUSK": 1.8
+  },
+  "initial_cash": 9.2,
   "start_date": "2025-08-09",
   "report_timezone": "America/Argentina/Buenos_Aires",
   "use_adjusted_close": false
