@@ -2,7 +2,7 @@ name: Daily Portfolio Tracker
 
 on:
   schedule:
-    - cron: '20 20 * * *'
+    - cron: '20 20 * * *'   # 20:20 UTC (~17:20 Buenos Aires)
   workflow_dispatch:
 
 permissions:
@@ -11,15 +11,22 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+
       - name: Install deps
-        run: pip install -r requirements.txt
-      - name: Run tracker
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run tracker (Alpha Vantage)
         env:
           ALPHAVANTAGE_API_KEY: ${{ secrets.ALPHAVANTAGE_API_KEY }}
         run: python main.py
@@ -27,13 +34,55 @@ jobs:
       - name: Publish artifacts to docs
         run: |
           mkdir -p docs
-          cp -f data/portfolio_history.csv docs/portfolio_history.csv
           cp -f reports/latest_report.md docs/latest_report.md
-          
+          cp -f data/portfolio_history.csv docs/portfolio_history.csv
+
+      - name: Emit latest JSON for reporting
+        run: |
+          python - << 'PY'
+          import csv, json, os
+          csv_path = 'data/portfolio_history.csv'
+          if not os.path.exists(csv_path):
+              raise SystemExit('portfolio_history.csv not found')
+          with open(csv_path, newline='', encoding='utf-8') as f:
+            rows = list(csv.DictReader(f))
+          last = rows[-1] if rows else {}
+          out = {
+            "date": last.get("date"),
+            "cash": last.get("cash"),
+            "total_value": last.get("total_value"),
+            "prices": {
+              "KLTR": last.get("KLTR_close"),
+              "LUNG": last.get("LUNG_close"),
+              "STTK": last.get("STTK_close"),
+              "MX":   last.get("MX_close"),
+              "TUSK": last.get("TUSK_close")
+            },
+            "quantities": {
+              "KLTR": last.get("KLTR_qty"),
+              "LUNG": last.get("LUNG_qty"),
+              "STTK": last.get("STTK_qty"),
+              "MX":   last.get("MX_qty"),
+              "TUSK": last.get("TUSK_qty")
+            },
+            "values": {
+              "KLTR": last.get("KLTR_value"),
+              "LUNG": last.get("LUNG_value"),
+              "STTK": last.get("STTK_value"),
+              "MX":   last.get("MX_value"),
+              "TUSK": last.get("TUSK_value")
+            },
+            "actions": last.get("actions")
+          }
+          os.makedirs('docs', exist_ok=True)
+          with open('docs/latest.json', 'w', encoding='utf-8') as f:
+            json.dump(out, f, indent=2)
+          PY
+
       - name: Commit results
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git add -A
           git commit -m "Update portfolio history [skip ci]" || echo "No changes"
           git push
