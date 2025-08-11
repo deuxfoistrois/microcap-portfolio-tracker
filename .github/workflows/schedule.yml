@@ -31,52 +31,70 @@ jobs:
           ALPHAVANTAGE_API_KEY: ${{ secrets.ALPHAVANTAGE_API_KEY }}
         run: python main.py
 
-      - name: Publish artifacts to docs
-        run: |
-          mkdir -p docs
-          cp -f reports/latest_report.md docs/latest_report.md
-          cp -f data/portfolio_history.csv docs/portfolio_history.csv
-
-      - name: Emit latest JSON for reporting
+      - name: Build latest.json and latest_report.md from CSV
         run: |
           python - << 'PY'
           import csv, json, os
+
           csv_path = 'data/portfolio_history.csv'
           if not os.path.exists(csv_path):
               raise SystemExit('portfolio_history.csv not found')
+
           with open(csv_path, newline='', encoding='utf-8') as f:
-            rows = list(csv.DictReader(f))
-          last = rows[-1] if rows else {}
+              rows = list(csv.DictReader(f))
+          if not rows:
+              raise SystemExit('portfolio_history.csv is empty')
+
+          last = rows[-1]
+
+          def fnum(x, default=None):
+              try:
+                  return float(x)
+              except (TypeError, ValueError):
+                  return default
+
+          tickers = ["KLTR","LUNG","STTK","MX","TUSK"]
+
+          prices = {t: last.get(f"{t}_close") for t in tickers}
+          qtys   = {t: last.get(f"{t}_qty")   for t in tickers}
+          vals   = {t: last.get(f"{t}_value") for t in tickers}
+
           out = {
             "date": last.get("date"),
             "cash": last.get("cash"),
             "total_value": last.get("total_value"),
-            "prices": {
-              "KLTR": last.get("KLTR_close"),
-              "LUNG": last.get("LUNG_close"),
-              "STTK": last.get("STTK_close"),
-              "MX":   last.get("MX_close"),
-              "TUSK": last.get("TUSK_close")
-            },
-            "quantities": {
-              "KLTR": last.get("KLTR_qty"),
-              "LUNG": last.get("LUNG_qty"),
-              "STTK": last.get("STTK_qty"),
-              "MX":   last.get("MX_qty"),
-              "TUSK": last.get("TUSK_qty")
-            },
-            "values": {
-              "KLTR": last.get("KLTR_value"),
-              "LUNG": last.get("LUNG_value"),
-              "STTK": last.get("STTK_value"),
-              "MX":   last.get("MX_value"),
-              "TUSK": last.get("TUSK_value")
-            },
+            "prices": prices,
+            "quantities": qtys,
+            "values": vals,
             "actions": last.get("actions")
           }
+
           os.makedirs('docs', exist_ok=True)
           with open('docs/latest.json', 'w', encoding='utf-8') as f:
-            json.dump(out, f, indent=2)
+              json.dump(out, f, indent=2)
+
+          # Render del reporte .md
+          lines = []
+          lines.append("# Portfolio Report")
+          lines.append(f"**As of (latest close)**: {last.get('date','')}")
+          lines.append("")
+          total = fnum(last.get('total_value'), 0.0)
+          cash  = fnum(last.get('cash'), 0.0)
+          for t in tickers:
+              px = fnum(prices.get(t), 0.0)
+              q  = fnum(qtys.get(t), 0.0)
+              v  = fnum(vals.get(t), 0.0)
+              lines.append(f"- {t}: close {px:.4f}, qty {int(q)}, value ${v:.2f}")
+          lines.append("")
+          lines.append(f"Cash: ${cash:.2f}")
+          lines.append(f"**Total value**: ${total:.2f}")
+          if last.get("actions"):
+              lines.append("")
+              lines.append(f"**Actions**: {last.get('actions')}")
+          with open('docs/latest_report.md', 'w', encoding='utf-8') as f:
+              f.write("\n".join(lines))
+
+          print("Wrote docs/latest.json and docs/latest_report.md")
           PY
 
       - name: Commit results
