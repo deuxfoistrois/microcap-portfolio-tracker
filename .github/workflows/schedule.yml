@@ -1,4 +1,4 @@
-name: Daily Portfolio Tracker
+name: Daily Portfolio Tracker (read raw JSON -> report + Excel)
 
 on:
   schedule:
@@ -11,7 +11,6 @@ permissions:
 jobs:
   run:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -24,77 +23,178 @@ jobs:
       - name: Install deps
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install pandas requests XlsxWriter
 
-      - name: Run tracker (Alpha Vantage)
+      - name: Build daily report + Excel (from raw JSON)
         env:
-          ALPHAVANTAGE_API_KEY: ${{ secrets.ALPHAVANTAGE_API_KEY }}
-        run: python main.py
-
-      - name: Build latest.json and latest_report.md from CSV
+          FEED_URL: https://raw.githubusercontent.com/deuxfoistrois/microcap-portfolio-tracker/main/docs/latest.json
+          BASE_DATE: '2025-08-09'
+          BASE_VALUE: '1000.00'
         run: |
           python - << 'PY'
-          import csv, json, os
+          import os, json, math, csv, requests
+          from datetime import datetime, date
+          import pandas as pd
 
-          csv_path = 'data/portfolio_history.csv'
-          if not os.path.exists(csv_path):
-              raise SystemExit('portfolio_history.csv not found')
+          FEED_URL   = os.environ['FEED_URL']
+          BASE_DATE  = os.environ['BASE_DATE']
+          BASE_VALUE = float(os.environ['BASE_VALUE'])
 
-          with open(csv_path, newline='', encoding='utf-8') as f:
-              rows = list(csv.DictReader(f))
-          if not rows:
-              raise SystemExit('portfolio_history.csv is empty')
+          # --- fetch ---
+          try:
+              r = requests.get(FEED_URL, timeout=30)
+              r.raise_for_status()
+              payload = r.json()
+          except Exception as e:
+              raise SystemExit(f"ERROR reading latest.json: {e}")
 
-          last = rows[-1]
-
-          def fnum(x, default=None):
+          # --- parse ---
+          def fnum(x, d=0.0):
               try:
                   return float(x)
-              except (TypeError, ValueError):
-                  return default
+              except Exception:
+                  return d
 
-          tickers = ["KLTR","LUNG","STTK","MX","TUSK"]
+          asof = payload.get('date')
+          cash = fnum(payload.get('cash'))
+          prices = {k: fnum(v) for k, v in (payload.get('prices') or {}).items()}
+          qtys   = {k: int(fnum(v, 0)) for k, v in (payload.get('quantities') or {}).items()}
+          acts   = payload.get('actions') or ""
 
-          prices = {t: last.get(f"{t}_close") for t in tickers}
-          qtys   = {t: last.get(f"{t}_qty")   for t in tickers}
-          vals   = {t: last.get(f"{t}_value") for t in tickers}
+          if not asof or not prices or not qtys:
+              raise SystemExit("ERROR: latest.json missing required fields (date/prices/quantities).")
 
-          out = {
-            "date": last.get("date"),
-            "cash": last.get("cash"),
-            "total_value": last.get("total_value"),
-            "prices": prices,
-            "quantities": qtys,
-            "values": vals,
-            "actions": last.get("actions")
-          }
+          # valores por ticker
+          values = {}
+          for t in qtys:
+              px = prices.get(t, 0.0)
+              q  = qtys.get(t, 0)
+              values[t] = round(px * q, 2)
 
-          os.makedirs('docs', exist_ok=True)
-          with open('docs/latest.json', 'w', encoding='utf-8') as f:
-              json.dump(out, f, indent=2)
+          total_positions = round(sum(values.values()), 2)
+          total_value = round(cash + total_positions, 2)
 
-          # Render del reporte .md
-          lines = []
-          lines.append("# Portfolio Report")
-          lines.append(f"**As of (latest close)**: {last.get('date','')}")
-          lines.append("")
-          total = fnum(last.get('total_value'), 0.0)
-          cash  = fnum(last.get('cash'), 0.0)
+          # --- history CSV (for daily P/L and cumulative) ---
+          os.makedirs('data', exist_ok=True)
+          hist_path = 'data/portfolio_history.csv'
+          cols_min = ['date','cash','total_value','actions']
+          tickers = sorted(qtys.keys())
+          # columnas dinámicas por ticker
+          extra_cols = []
           for t in tickers:
-              px = fnum(prices.get(t), 0.0)
-              q  = fnum(qtys.get(t), 0.0)
-              v  = fnum(vals.get(t), 0.0)
-              lines.append(f"- {t}: close {px:.4f}, qty {int(q)}, value ${v:.2f}")
-          lines.append("")
-          lines.append(f"Cash: ${cash:.2f}")
-          lines.append(f"**Total value**: ${total:.2f}")
-          if last.get("actions"):
-              lines.append("")
-              lines.append(f"**Actions**: {last.get('actions')}")
-          with open('docs/latest_report.md', 'w', encoding='utf-8') as f:
-              f.write("\n".join(lines))
+              extra_cols += [f"{t}_close", f"{t}_qty", f"{t}_value"]
 
-          print("Wrote docs/latest.json and docs/latest_report.md")
+          # read history
+          hist = []
+          if os.path.exists(hist_path):
+              with open(hist_path, newline='', encoding='utf-8') as f:
+                  hist = list(csv.DictReader(f))
+
+          # daily P/L vs last row
+          if hist:
+              prev_total = float(hist[-1].get('total_value', '0') or 0)
+              pl_daily = round(total_value - prev_total, 2)
+          else:
+              pl_daily = 0.0
+
+          # cumulative since BASE_DATE
+          base_row = next((r for r in hist if r.get('date') == BASE_DATE), None)
+          base_val = float(base_row['total_value']) if base_row and base_row.get('total_value') else BASE_VALUE
+          pl_cum = round(total_value - base_val, 2)
+
+          # --- stop-loss checks (optional) ---
+          # If docs/stops.json exists, expect {"TICKER": level, ...}; closing-basis breach flag only (no file mutation).
+          alerts = []
+          stops_path = 'docs/stops.json'
+          stops = {}
+          if os.path.exists(stops_path):
+              try:
+                  with open(stops_path, 'r', encoding='utf-8') as f:
+                      stops = json.load(f) or {}
+              except Exception:
+                  stops = {}
+          for t, level in (stops or {}).items():
+              px = prices.get(t)
+              if isinstance(level, (int,float)) and isinstance(px, (int,float)):
+                  if px <= float(level):
+                      # compute hypothetical post-sell cash
+                      q = qtys.get(t, 0)
+                      if q > 0:
+                          est_cash_after = round(cash + q * px, 2)
+                          alerts.append(f"STOP BREACHED {t}: close {px:.4f} ≤ {float(level):.4f} -> propose SELL {q} @ close; est. cash {est_cash_after:.2f}")
+
+          # --- write latest_report.md ---
+          os.makedirs('docs', exist_ok=True)
+          md = []
+          md.append("# Portfolio Report")
+          md.append(f"**As of (latest close)**: {asof}")
+          md.append("")
+          for t in tickers:
+              md.append(f"- {t}: close {prices.get(t,0.0):.4f}, qty {qtys.get(t,0)}, value ${values.get(t,0.0):.2f}")
+          md.append("")
+          md.append(f"Cash: ${cash:.2f}")
+          md.append(f"**Total value**: ${total_value:.2f}")
+          md.append("")
+          md.append(f"**Daily P/L**: {pl_daily:+.2f}")
+          md.append(f"**Cumulative P/L since {BASE_DATE}**: {pl_cum:+.2f}")
+          if acts:
+              md.append("")
+              md.append(f"**Actions (source)**: {acts}")
+          if alerts:
+              md.append("")
+              md.append("**Stop-loss alerts (closing-basis):**")
+              for a in alerts:
+                  md.append(f"- {a}")
+
+          with open('docs/latest_report.md','w',encoding='utf-8') as f:
+              f.write("\n".join(md))
+
+          # also persist a dated copy
+          with open(f"docs/report_{asof}.md",'w',encoding='utf-8') as f:
+              f.write("\n".join(md))
+
+          # --- write/update history CSV ---
+          row = {'date': asof, 'cash': f"{cash:.2f}", 'total_value': f"{total_value:.2f}", 'actions': acts}
+          for t in tickers:
+              row[f"{t}_close"] = f"{prices.get(t,0.0):.4f}"
+              row[f"{t}_qty"]   = str(qtys.get(t,0))
+              row[f"{t}_value"] = f"{values.get(t,0.0):.2f}"
+
+          # rewrite CSV with unified header
+          header = cols_min + extra_cols
+          # ensure all old rows have all columns
+          def fill(r):
+              for c in header:
+                  r.setdefault(c, "")
+              return r
+          hist = [fill(dict(r)) for r in hist]
+          hist.append(fill(row))
+
+          with open(hist_path, 'w', newline='', encoding='utf-8') as f:
+              w = csv.DictWriter(f, fieldnames=header)
+              w.writeheader()
+              w.writerows(hist)
+
+          # --- Excel report (docs/daily_report_YYYY-MM-DD.xlsx) ---
+          xls_path = f"docs/daily_report_{asof}.xlsx"
+          df_positions = pd.DataFrame({
+              'Ticker': tickers,
+              'Close': [prices[t] for t in tickers],
+              'Qty':   [qtys[t] for t in tickers],
+              'Value': [values[t] for t in tickers],
+          })
+          df_port = pd.DataFrame([{
+              'AsOf': asof,
+              'Cash': round(cash,2),
+              'TotalValue': round(total_value,2),
+              'PL_Daily': pl_daily,
+              f'PL_Cumulative_since_{BASE_DATE}': pl_cum
+          }])
+          with pd.ExcelWriter(xls_path, engine='xlsxwriter') as writer:
+              df_port.to_excel(writer, index=False, sheet_name='Portfolio')
+              df_positions.to_excel(writer, index=False, sheet_name='Positions')
+
+          print(f"OK: wrote docs/latest_report.md, docs/report_{asof}.md, data/portfolio_history.csv, {xls_path}")
           PY
 
       - name: Commit results
@@ -102,5 +202,5 @@ jobs:
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git add -A
-          git commit -m "Update portfolio history [skip ci]" || echo "No changes"
+          git commit -m "Daily report + Excel [skip ci]" || echo "No changes"
           git push
